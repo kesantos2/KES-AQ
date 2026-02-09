@@ -1,0 +1,173 @@
+// =======================================================
+// MAIAC AOD (MCD19A2.061) — ROI: projects/ee-kesantos2/assets/SF
+// 2015–2022 | Map preview, memory-safe daily chart, optional exports
+// =======================================================
+
+// ---------------- CONFIG ----------------
+var ADD_PM25_EST = true;          // add PM2.5 estimate column using η * AOD
+var USE_MONTHLY_FACTORS = true;   // true: month-specific η; false: single η
+var ETA_SINGLE = 100;             // µg m-3 per AOD (if not monthly)
+var ETA_BY_MONTH = ee.Dictionary({
+  '01': 95,  '02': 95,  '03': 100, '04': 105,
+  '05': 110, '06': 115, '07': 120, '08': 120,
+  '09': 110, '10': 105, '11': 100, '12': 95
+});
+
+// ---------------- REGION (your asset) ----------------
+var roiFC = ee.FeatureCollection('projects/ee-kesantos2/assets/MM');
+var roi   = roiFC.union(100).geometry();
+var roiSimple = ee.Geometry(roi).simplify(1000); // simplify for faster reductions
+
+// ---------------- DATA (MAIAC v061) ----------------
+var src = ee.ImageCollection('MODIS/061/MCD19A2_GRANULES')
+  .filterDate('2015-01-01', '2022-12-31');
+
+// ---------------- QA MASK ----------------
+function maskMAIAC(img) {
+  var qa = img.select('AOD_QA');
+  var cloudClear  = qa.bitwiseAnd(7).eq(1);                // bits 0–2 == 1 (Clear)
+  var landOnly    = qa.rightShift(3).bitwiseAnd(3).eq(0);  // bits 3–4 == 0 (Land)
+  var noAdjacent  = qa.rightShift(5).bitwiseAnd(7).eq(0);  // bits 5–7 == 0
+  var bestAOD     = qa.rightShift(8).bitwiseAnd(15).eq(0); // bits 8–11 == 0 (Best)
+  return img.updateMask(cloudClear.and(landOnly).and(noAdjacent).and(bestAOD));
+}
+
+// ---------------- COLLECTIONS ----------------
+var aod047_raw = src.map(maskMAIAC).select('Optical_Depth_047'); // raw 0–1100
+var aod047_scaled = aod047_raw.map(function(img){
+  var scaled = img.multiply(0.001); // true AOD (unitless)
+  return scaled.copyProperties(img, img.propertyNames());
+});
+
+// ---------------- MAP PREVIEW (2023 mean, raw scale) ----------------
+var preview = aod047_raw.filterDate('2023-01-01','2023-12-31').mean().clip(roi);
+Map.centerObject(roi, 10);
+Map.addLayer(
+  preview,
+  {min: 0, max: 1100, palette: ['black','blue','purple','cyan','green','yellow','red']},
+  'MAIAC AOD047 (raw scale, 2023 mean)'
+);
+Map.addLayer(roi, {color: 'white'}, 'ROI Boundary', false);
+
+// ---------------- HELPERS ----------------
+function etaForDate(date) {
+  var mm = ee.Date(date).format('MM');
+  return ee.Number(ee.Algorithms.If(USE_MONTHLY_FACTORS, ETA_BY_MONTH.get(mm), ETA_SINGLE));
+}
+
+// ---------------- MEMORY-SAFE DAILY TABLE (empty-day guards) ----------------
+function dailyTableForYear(y) {
+  var start = ee.Date.fromYMD(y, 1, 1);
+  var end   = start.advance(1, 'year');
+  var colY  = aod047_raw.filterDate(start, end); // raw for counting
+
+  var days = ee.List.sequence(0, end.difference(start, 'day').subtract(1));
+  var feats = days.map(function(d){
+    var t0 = start.advance(d, 'day');
+    var t1 = t0.advance(1, 'day');
+
+    var dayCol = colY.filterDate(t0, t1);
+    var hasImages = dayCol.size().gt(0);
+
+    var stats = ee.Dictionary(ee.Algorithms.If(
+      hasImages,
+      ee.Image(dayCol.mean()).reduceRegion({
+        reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.count(), sharedInputs: true}),
+        geometry: roiSimple,
+        scale: 2000,         // coarser scale to reduce memory
+        bestEffort: true,
+        maxPixels: 1e13,
+        tileScale: 2
+      }),
+      ee.Dictionary({})
+    ));
+
+    // Safely read keys; if missing, use 0/null
+    var hasCountKey = stats.contains('Optical_Depth_047_count');
+    var count = ee.Number(ee.Algorithms.If(hasCountKey, stats.get('Optical_Depth_047_count'), 0));
+    var hasPixels = count.gt(0);
+
+    var hasMeanKey = stats.contains('Optical_Depth_047_mean');
+    var mean_raw = ee.Number(ee.Algorithms.If(
+      hasMeanKey,
+      ee.Algorithms.If(hasPixels, stats.get('Optical_Depth_047_mean'), null),
+      null
+    ));
+
+    var aod_unitless = ee.Algorithms.If(
+      mean_raw,
+      ee.Number(mean_raw).multiply(0.001),
+      null
+    );
+
+    var pm25_est = ee.Algorithms.If(
+      ADD_PM25_EST,
+      ee.Algorithms.If(mean_raw,
+        ee.Number(aod_unitless).multiply(etaForDate(t0)),
+        null
+      ),
+      null
+    );
+
+    return ee.Feature(null, {
+      date: t0.format('YYYY-MM-dd'),
+      millis: t0.millis(),
+      aod047_mean: aod_unitless,               // unitless (null if no data)
+      n_pixels: ee.Algorithms.If(hasPixels, count, 0),
+      pm25_est_ugm3: pm25_est                  // µg m-3 (null if disabled or no data)
+    });
+  });
+
+  return ee.FeatureCollection(feats);
+}
+
+// Build all years and a light FC for charting
+var years = ee.List([2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022]);
+var tsAll = ee.FeatureCollection(years.map(dailyTableForYear)).flatten();
+
+// ---------------- CHART (from pre-aggregated FC) ----------------
+var tsForChart = tsAll.filter(ee.Filter.notNull(['aod047_mean']));
+var chart = ui.Chart.feature.byFeature(tsForChart, 'millis', 'aod047_mean')
+  .setOptions({
+    title: 'Daily MAIAC AOD (0.47 µm) — ROI (2015–2022)',
+    hAxis: {title: 'Date', format: 'yyyy-MM'},
+    vAxis: {title: 'AOD (unitless)'},
+    lineWidth: 2,
+    colors: ['#e37d05'],
+    curveType: 'function'
+  });
+print(chart);
+
+// ---------------- LEGEND (raw scale visualization) ----------------
+var legendTitle = ui.Label({
+  value: 'AOD (raw scale 0–1100)',
+  style: {fontWeight: 'bold', fontSize: '16px', margin: '0 0 6px 0'}
+});
+var legend = ui.Panel({style: {position: 'bottom-left', padding: '8px 15px'}});
+legend.add(legendTitle);
+var palette = ['black','blue','purple','cyan','green','yellow','red'];
+var labels  = ['0–100','100–300','300–500','500–700','700–850','850–1000','1000–1100'];
+palette.forEach(function(color, i){
+  var row = ui.Panel({
+    widgets: [
+      ui.Label({style: {backgroundColor: color, padding: '8px', margin: '0 6px 4px 0'}}),
+      ui.Label({value: labels[i], style: {margin: '0 0 4px 0'}})
+    ],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  });
+  legend.add(row);
+});
+Map.add(legend);
+
+// ---------------- OPTIONAL: per-year exports (CSV) ----------------
+// Columns: date, aod047_mean (unitless), n_pixels, pm25_est_ugm3 (if enabled)
+// Uncomment to export.
+years.getInfo().forEach(function(y){
+  var fc = dailyTableForYear(y);
+  Export.table.toDrive({
+    collection: fc,
+    description: 'ROI_MAIAC_AOD_daily_' + y + (ADD_PM25_EST ? '_with_PM25' : ''),
+    fileNamePrefix: 'ROI_MAIAC_AOD_daily_' + y + (ADD_PM25_EST ? '_with_PM25' : ''),
+    fileFormat: 'CSV'
+  });
+});
