@@ -1,0 +1,34 @@
+// Define Metro Manila bounding box
+var metroManila = ee.Geometry.Rectangle([120.85, 14.45, 121.15, 14.85]);
+
+// Define wet and dry seasons (adjust years as needed)
+var drySeason = ee.ImageCollection('MODIS/061/MCD19A2_GRANULES')
+  .filterBounds(metroManila)
+  .filterDate('2023-01-01', '2023-05-31');
+
+var wetSeason = ee.ImageCollection('MODIS/061/MCD19A2_GRANULES')
+  .filterBounds(metroManila)
+  .filterDate('2023-06-01', '2023-11-30');
+
+// Apply QA filter: keep AOD_QA ≤ 1 (best or good quality)
+var processSeason = function(collection) {
+  return collection.map(function(img) {
+    var mask = img.select('AOD_QA').lte(1);  // Accept best and good quality
+    return img.updateMask(mask).select('Optical_Depth_055');
+  });
+};
+
+var dryAOD = processSeason(drySeason).mean().clip(metroManila);
+var wetAOD = processSeason(wetSeason).mean().clip(metroManila);
+
+// Visualization settings
+var viz = {
+  min: 0,
+  max: 1.0,
+  palette: ['black', 'blue', 'purple', 'cyan', 'green', 'yellow', 'red']
+};
+
+// Display both maps
+Map.centerObject(metroManila, 10);
+Map.addLayer(dryAOD, viz, 'Dry Season AOD (Jan–May 2023)');
+Map.addLayer(wetAOD, viz, 'Wet Season AOD (Jun–Nov 2023)');
