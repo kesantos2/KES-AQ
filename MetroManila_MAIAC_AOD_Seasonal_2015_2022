@@ -1,0 +1,147 @@
+// =======================================================
+// Metro Manila MAIAC AOD — Seasonal CSV only (2015–2022)
+// ROI: your asset (fallback: rectangle). No charts, export only.
+// =======================================================
+
+// ---------------- USER CONFIG ----------------
+var USE_ROI_ASSET = true;                        // set false to use fallback box
+var ROI_ASSET = 'projects/ee-kesantos2/assets/MM';
+
+var YEARS = ee.List.sequence(2015, 2022);
+var BAND = 'Optical_Depth_047';                 // or 'Optical_Depth_055'
+var SCALE_RAW_TO_UNIT = 0.001;                  // MAIAC -> unitless AOD
+
+// Season definition
+// Dry = Jan–May; Wet = Jun–Nov. Toggle Dec inclusion below.
+var INCLUDE_DEC_IN_DRY = false;                 // true => Dry = Jan–May + Dec
+
+// Optional PM2.5 estimate η (µg m-3 per AOD)
+var ADD_PM25_EST = false;                       // set true if you want PM2.5 estimates
+var USE_MONTHLY_FACTORS = true;
+var ETA_SINGLE = 100;
+var ETA_BY_MONTH = ee.Dictionary({
+  '01': 95,  '02': 95,  '03': 100, '04': 105,
+  '05': 110, '06': 115, '07': 120, '08': 120,
+  '09': 110, '10': 105, '11': 100, '12': 95
+});
+
+// Export toggle
+var RUN_EXPORT = true;                          // set false for a dry run (no export)
+
+// ---------------- ROI ----------------
+var fallbackRect = ee.Geometry.Rectangle([120.85, 14.45, 121.15, 14.85]); // NCR box
+var roi = ee.Geometry(
+  ee.Algorithms.If(
+    USE_ROI_ASSET,
+    ee.FeatureCollection(ROI_ASSET).union(100).geometry(),
+    fallbackRect
+  )
+);
+var roiSimple = roi.simplify(1000);
+
+// ---------------- DATA SOURCE ----------------
+var src = ee.ImageCollection('MODIS/061/MCD19A2_GRANULES')
+  .filterBounds(roi)
+  .filterDate('2015-01-01', '2022-12-31');
+
+// ---------------- MAIAC QA MASK (conservative) ----------------
+function maskMAIAC(img) {
+  var qa = img.select('AOD_QA');
+  var cloudClear  = qa.bitwiseAnd(7).eq(1);                // bits 0–2 == 1 (Clear)
+  var landOnly    = qa.rightShift(3).bitwiseAnd(3).eq(0);  // bits 3–4 == 0 (Land)
+  var noAdjacent  = qa.rightShift(5).bitwiseAnd(7).eq(0);  // bits 5–7 == 0
+  var bestAOD     = qa.rightShift(8).bitwiseAnd(15).eq(0); // bits 8–11 == 0 (Best)
+  return img.updateMask(cloudClear.and(landOnly).and(noAdjacent).and(bestAOD));
+}
+var aod_raw = src.map(maskMAIAC).select(BAND); // 0–1100 (int)
+var aod     = aod_raw.map(function(i){ return i.multiply(SCALE_RAW_TO_UNIT)
+                                        .copyProperties(i, i.propertyNames()); });
+
+// ---------------- HELPERS ----------------
+function seasonCollections(y) {
+  y = ee.Number(y);
+  var start = ee.Date.fromYMD(y, 1, 1);
+  var end   = start.advance(1, 'year');
+
+  var dryMain = aod.filterDate(start, start.advance(5, 'month'));         // Jan–May
+  var dryDec  = INCLUDE_DEC_IN_DRY ? aod.filterDate(start.advance(11,'month'), end) : ee.ImageCollection([]);
+  var dryCol  = dryMain.merge(dryDec);
+
+  var wetCol  = aod.filterDate(start.advance(5, 'month'), start.advance(11, 'month')); // Jun–Nov
+
+  return {dry: dryCol, wet: wetCol};
+}
+
+function roiMean(col) {
+  var img = ee.Image(col.mean());
+  var dict = img.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: roiSimple,
+    scale: 2000,
+    bestEffort: true,
+    maxPixels: 1e13,
+    tileScale: 2
+  });
+  return ee.Number(dict.get(BAND));
+}
+
+function avgEtaForMonths(monthList) {
+  var etas = ee.List(monthList).map(function(m){
+    var mm = ee.String(ee.Number(m).format('%02d'));
+    return ee.Number(ETA_BY_MONTH.get(mm));
+  });
+  return ee.Number(etas.reduce(ee.Reducer.mean()));
+}
+
+function pm25FromAOD(aodMean, months) {
+  if (!ADD_PM25_EST) return null;
+  return ee.Algorithms.If(
+    USE_MONTHLY_FACTORS,
+    ee.Number(aodMean).multiply(avgEtaForMonths(months)),
+    ee.Number(aodMean).multiply(ETA_SINGLE)
+  );
+}
+
+// Build one Feature per (year, season)
+function seasonalFeature(y, season, col, months) {
+  var aodMean = roiMean(col); // unitless already
+  var imgCount = ee.Number(col.size());
+  var pm25 = pm25FromAOD(aodMean, months);
+  return ee.Feature(null, {
+    year: ee.Number(y),
+    season: season,
+    aod_mean: aodMean,                     // unitless
+    images_used: imgCount,
+    pm25_est_ugm3: ADD_PM25_EST ? pm25 : null
+  });
+}
+
+// Assemble long-format table: columns = year, season, aod_mean, images_used, pm25_est_ugm3
+var seasonalLong = ee.FeatureCollection(
+  YEARS.map(function(y){
+    var sc = seasonCollections(y);
+
+    // Months used (for documentation / PM2.5 monthly-η averaging)
+    var dryMonths = INCLUDE_DEC_IN_DRY ? [1,2,3,4,5,12] : [1,2,3,4,5];
+    var wetMonths = [6,7,8,9,10,11];
+
+    var fDry = seasonalFeature(y, 'Dry', sc.dry, dryMonths);
+    var fWet = seasonalFeature(y, 'Wet', sc.wet, wetMonths);
+    return ee.FeatureCollection([fDry, fWet]);
+  })
+).flatten();
+
+// Quick peek in the Console
+print('Seasonal AOD (long format)', seasonalLong.limit(10));
+
+// ---------------- EXPORT (single CSV) ----------------
+if (RUN_EXPORT) {
+  Export.table.toDrive({
+    collection: seasonalLong,
+    description: 'MetroManila_MAIAC_AOD_Seasonal_2015_2022' +
+                 (INCLUDE_DEC_IN_DRY ? '_DryIncludesDec' : ''),
+    fileNamePrefix: 'MetroManila_MAIAC_AOD_Seasonal_2015_2022' +
+                    (INCLUDE_DEC_IN_DRY ? '_DryIncludesDec' : ''),
+    fileFormat: 'CSV'
+  });
+}
